@@ -18,7 +18,7 @@ operator confirmation, not a hardware interlock.
   TLS.
 - Stop the ROV bridge/gateway before starting this tool. Only one process can
   own `/dev/ttyACM0`.
-- The tool caps throttle at 20% and duration at 10 seconds per test, but those
+- The tool caps thrust at +/-40% and duration at 10 seconds per test, but those
   limits do not make an unsecured vehicle safe.
 - This is a bench/setup tool, not a flight-control interface.
 
@@ -71,7 +71,9 @@ The tool is not installed as a systemd service, so restart it after a reboot.
 
 1. Remove propellers or disconnect thruster power.
 2. Open the web page and confirm the `props off` checkbox.
-3. Set throttle (default 5%) and duration (default 3 s).
+3. Set thrust (default +20%, 0 = stop, PWM = 1500 + thrust*4) and duration.
+   The PWM column in the live table is the ground truth; ArduPilot's motor-test
+   percent scale is *not* a thrust percentage.
 4. Click `M1` ... `M8` one at a time.
 5. Record the actual position and direction in the table.
 6. Use `Export JSON` to save the mapping.
@@ -79,19 +81,48 @@ The tool is not installed as a systemd service, so restart it after a reboot.
 The mapping table is stored in the browser's `localStorage`; it is not uploaded
 anywhere. Clearing site data or using another browser loses it.
 
+## Mount and lights
+
+`云台舵机` drives AUX1 through `MAV_CMD_DO_MOUNT_CONTROL` (mode
+`MAV_MOUNT_MODE_MAVLINK_TARGETING`). It only works when `SERVO9_FUNCTION=7`
+(`mount_tilt`); the page warns at connect if it is anything else. The pitch
+slider range comes from `MNT1_PITCH_MIN/MAX` (this vehicle: -90..+20), so
+0 deg maps to ~1754, not 1500.
+
+`灯` drives AUX2 through `MANUAL_CONTROL.buttons`, which ArduSub routes to the
+`BTNx_FUNCTION` joystick handlers. On this vehicle `BTN14_FUNCTION=32`
+(brighter) and `BTN13_FUNCTION=33` (dimmer). Those bits are discovered at
+connect; the page warns if none is mapped. `DO_SET_SERVO` cannot be used here
+because AUX2 is owned by `lights1`.
+
 ## HTTP API
 
 `POST /api/test`
 
 ```json
-{"motor": 1, "percent": 5, "seconds": 3, "props_off": true}
+{"motor": 1, "thrust": 20, "seconds": 3, "props_off": true}
 ```
+
+`POST /api/mount` takes `{"pitch": -90}` (degrees).
+
+`POST /api/light` takes `{"name": "brighter"|"dimmer"|"cycle", "repeat": 1..12}`.
 
 `POST /api/stop` stops the current test and disarms. `POST /api/disarm` also
 disarms. `GET /api/status` returns the current state.
 
 The server rejects `props_off` values other than `true`, motor numbers outside
-1..8, throttle above 20%, and duration above 10 seconds.
+1..8, `thrust` outside -40..40 or equal to 0, and duration above 10 seconds.
+Internally the tool sends ArduPilot motor-test percent, which the firmware maps
+linearly onto RC3_MIN..MAX (1100..1900): percent 50 is neutral (PWM 1500) and
+percent 5 would be PWM 1140, almost full reverse.
+
+## Live output check
+
+`SERVO_OUTPUT_RAW` is streamed at 10 Hz and shown as M1..M8. If the commanded
+channel does not reach 1500 + thrust*4 within 1.5 s, the test aborts and
+disarms with `Mx 无响应` -- the FC accepting arm but ignoring the motor test
+has been seen on the bench, and without this check a dead test looks like a
+successful one.
 
 ## Motor numbering and ArduSub workaround
 
