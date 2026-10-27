@@ -18,8 +18,14 @@ from pymavlink import mavutil
 SERIAL = '/dev/ttyACM0'
 BAUD = 115200
 HTTP_PORT = 8088
-MAX_PERCENT = 20.0
+# Signed thrust in percent of full scale: 0 = stop (PWM 1500), +40 = PWM 1660.
+# ArduPilot's MOTOR_TEST_THROTTLE_PERCENT maps linearly onto RC3_MIN..MAX
+# (1100..1900), so percent 5 really means PWM 1140 -- almost full reverse.
+MAX_THRUST = 40.0
 MAX_SECONDS = 10.0
+VERIFY_TIMEOUT = 1.5
+MOUNT_FUNC = 7          # SERVO9_FUNCTION value that makes AUX1 the mount tilt servo
+BTN_LIGHTS = {32: 'brighter', 33: 'dimmer', 31: 'cycle'}  # JSButton lights functions
 ARM_TIMEOUT = 6.0
 DISARM_TIMEOUT = 3.0
 
@@ -69,7 +75,7 @@ select{background:#232833;color:var(--fg);border:1px solid var(--line);border-ra
 <div class="card">
   <label class="check"><input type="checkbox" id="propsOff"> 我确认：螺旋桨已拆或推进器已断电，周围无人</label>
   <div class="row" style="margin-top:12px">
-    <label>油门 <b id="pctLabel">5%</b><br><input type="range" id="pct" min="1" max="20" value="5" step="1"></label>
+    <label>推力 <b id="thrustLabel">+20%</b><br><input type="range" id="thrust" min="-40" max="40" value="20" step="5"></label>
     <label>时长 <b id="durLabel">3s</b><br><input type="range" id="dur" min="1" max="10" value="3" step="1"></label>
     <button class="danger" id="stop" disabled>紧急停止 / Disarm</button>
   </div>
@@ -93,6 +99,50 @@ select{background:#232833;color:var(--fg);border:1px solid var(--line);border-ra
 
 <div class="card">
   <div class="row" style="justify-content:space-between">
+    <b>实时输出 SERVO_OUTPUT_RAW</b>
+    <span class="mono" id="expected"></span>
+  </div>
+  <div class="status" id="outs" style="margin-top:8px"></div>
+  <div class="mono" style="margin-top:8px;color:var(--muted)">
+    测试期间混控被旁路：非被测通道冻结在测试前的值（通常 1500）。被测通道没偏离目标 → 自动中止并 disarm。
+  </div>
+</div>
+
+<div class="card">
+  <div class="row" style="justify-content:space-between">
+    <b>云台舵机 AUX1（mount tilt）</b>
+    <span class="mono">当前 PWM <b id="aux1">-</b></span>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <label>俯仰 <b id="pitchLabel">0°</b><br><input type="range" id="pitch" min="-90" max="20" value="0" step="1"></label>
+    <button id="pitchMin">最下</button>
+    <button id="pitchZero">0°</button>
+    <button id="pitchMax">最上</button>
+  </div>
+  <div class="mono" style="margin-top:8px;color:var(--muted)">
+    走 <span class="mono">DO_MOUNT_CONTROL</span>。注意 0° 对应 ≈1754 而非 1500：`MNT1_PITCH_MIN=-90 / MAX=+20` 不对称。
+  </div>
+</div>
+
+<div class="card">
+  <div class="row" style="justify-content:space-between">
+    <b>灯 AUX2（lights1）</b>
+    <span class="mono">当前 PWM <b id="aux2">-</b></span>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <button id="lightOff">全灭</button>
+    <button id="lightDown">暗一档</button>
+    <button id="lightUp">亮一档</button>
+    <button id="lightOn">全亮</button>
+  </div>
+  <div class="mono" style="margin-top:8px;color:var(--muted)">
+    走 <span class="mono">MANUAL_CONTROL.buttons</span> → <span class="mono">BTNx_FUNCTION</span> 的分档调光。
+    AUX2 被 <span class="mono">lights1</span> 占用，<span class="mono">DO_SET_SERVO</span> 会被拒。
+  </div>
+</div>
+
+<div class="card">
+  <div class="row" style="justify-content:space-between">
     <b>实测记录（只存在本机浏览器）</b>
     <button id="export">导出 JSON</button>
   </div>
@@ -104,7 +154,7 @@ select{background:#232833;color:var(--fg);border:1px solid var(--line);border-ra
 </main>
 <script>
 const $ = id => document.getElementById(id);
-const state = {busy:false};
+const state = {busy:false, mountInit:false};
 const POS = ['未记录','前左','前右','后左','后右','前左垂','前右垂','后左垂','后右垂','其他'];
 const DIR = ['未记录','正转','反转'];
 const MAP_KEY = 'ou_motor_map_v1';
@@ -140,14 +190,51 @@ function setBusy(b){
   for(let i=1;i<=8;i++) $('m'+i).disabled=b || !$('propsOff').checked;
   $('stop').disabled=false;
 }
+function renderOuts(s){
+  const box=$('outs');
+  if(!box.children.length){
+    for(let i=1;i<=8;i++){
+      const d=document.createElement('div'); d.className='kv'; d.id='o'+i;
+      d.innerHTML='<b>M'+i+'</b><span>-</span>';
+      box.appendChild(d);
+    }
+  }
+  const out=s.out||[];
+  for(let i=1;i<=8;i++){
+    const span=$('o'+i).querySelector('span');
+    if(out.length>=i){ span.textContent=out[i-1]; span.style.color=''; }
+    else { span.textContent='-'; }
+  }
+  if(s.testing && s.motor && s.thrust!=null){
+    const target=Math.round(1500+s.thrust*4);
+    $('expected').textContent='M'+s.motor+' 目标 PWM '+target;
+    if(out.length>=s.motor){
+      const ok=Math.abs(out[s.motor-1]-target)<=25;
+      $('o'+s.motor).querySelector('span').style.color = ok ? 'var(--ok)' : 'var(--bad)';
+    }
+  } else {
+    $('expected').textContent='';
+  }
+}
+function renderAux(s){
+  $('aux1').textContent = s.aux ? s.aux[0] : '-';
+  $('aux2').textContent = s.aux ? s.aux[1] : '-';
+  if(s.mount_min!=null && !state.mountInit){
+    $('pitch').min=s.mount_min; $('pitch').max=s.mount_max;
+    state.mountInit=true;
+  }
+}
 function updateStatus(s){
   $('serial').innerHTML = s.serial_ok ? '<span class="badge ok">OK</span>' : '<span class="badge bad">FAIL</span>';
   $('mode').textContent = s.mode || '-';
   $('armed').innerHTML = s.armed ? '<span class="badge warn">ARMED</span>' : '<span class="badge">DISARMED</span>';
   $('phase').textContent = s.phase || 'idle';
-  $('motor').textContent = s.motor ? ('M'+s.motor+' '+s.percent+'%') : '-';
+  $('motor').textContent = s.motor ? ('M'+s.motor+' '+(s.thrust>0?'+':'')+s.thrust+'%') : '-';
   $('remaining').textContent = s.remaining != null ? (s.remaining.toFixed(1)+' s') : '-';
+  renderOuts(s);
+  renderAux(s);
   let msg=[];
+  if(s.warn) msg.push('WARN: '+s.warn);
   if(s.last_error) msg.push('ERROR: '+s.last_error);
   if(s.last_statustext) msg.push('FC: '+s.last_statustext);
   $('msg').textContent = msg.join('  |  ');
@@ -168,19 +255,37 @@ async function post(url,body){
 }
 async function testMotor(i){
   if(!$('propsOff').checked){ alert('先勾选“螺旋桨已拆/推进器已断电”'); return; }
-  const percent=+$('pct').value, seconds=+$('dur').value;
+  const thrust=+$('thrust').value, seconds=+$('dur').value;
+  if(!thrust){ alert('推力不能为 0（0 = 停转）'); return; }
   setBusy(true);
-  await post('/api/test',{motor:i,percent,seconds,props_off:true});
+  await post('/api/test',{motor:i,thrust,seconds,props_off:true});
 }
-$('pct').oninput=()=>$('pctLabel').textContent=$('pct').value+'%';
+$('thrust').oninput=()=>{
+  const v=+$('thrust').value;
+  $('thrustLabel').textContent=(v>0?'+':'')+v+'% → PWM '+Math.round(1500+v*4);
+};
 $('dur').oninput=()=>$('durLabel').textContent=$('dur').value+'s';
 $('propsOff').onchange=()=>setBusy(state.busy);
 $('stop').onclick=()=>post('/api/stop');
+function setPitch(v){
+  v=Math.round(v);
+  $('pitch').value=v; $('pitchLabel').textContent=v+'°';
+  post('/api/mount',{pitch:v});
+}
+$('pitch').oninput=()=>$('pitchLabel').textContent=$('pitch').value+'°';
+$('pitch').onchange=()=>post('/api/mount',{pitch:+$('pitch').value});
+$('pitchMin').onclick=()=>setPitch(+$('pitch').min);
+$('pitchZero').onclick=()=>setPitch(0);
+$('pitchMax').onclick=()=>setPitch(+$('pitch').max);
+$('lightOn').onclick=()=>post('/api/light',{name:'brighter',repeat:12});
+$('lightOff').onclick=()=>post('/api/light',{name:'dimmer',repeat:12});
+$('lightUp').onclick=()=>post('/api/light',{name:'brighter',repeat:1});
+$('lightDown').onclick=()=>post('/api/light',{name:'dimmer',repeat:1});
 $('export').onclick=()=>{
   const blob=new Blob([JSON.stringify(map,null,2)],{type:'application/json'});
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='motor_map.json';a.click();
 };
-renderMotors(); renderMap(); setBusy(false); poll();
+renderMotors(); renderMap(); setBusy(false); $('thrust').oninput(); poll();
 </script>
 </body></html>'''
 
@@ -196,11 +301,21 @@ class Tester:
             'testing': False,
             'phase': 'idle',
             'motor': None,
-            'percent': None,
+            'thrust': None,
+            'out': None,
+            'aux': None,
+            'mount_min': -90,
+            'mount_max': 20,
+            'mount_pitch': None,
+            'light_bits': {},
+            'warn': None,
             'remaining': None,
             'last_error': None,
             'last_statustext': None,
         }
+        self.out_ts = 0.0
+        self.verified = False
+        self.verify_deadline = 0.0
         self.mav = None
         self.pending = None
         self.testing = False
@@ -258,7 +373,43 @@ class Tester:
         self._set(serial_ok=True, mode=mavutil.mode_string_v10(hb),
                   armed=bool(hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED),
                   phase='idle')
+        # SERVO_OUTPUT_RAW (36) is the only honest view of what the ESCs get.
+        m.mav.command_long_send(1, 1, mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                                0, 36, 100000, 0, 0, 0, 0, 0)
+        self._init_aux()
         self._set(last_statustext='connected %s' % SERIAL)
+
+    def _fetch(self, names, timeout=4.0):
+        for n in names:
+            self.mav.param_fetch_one(n)
+        got = {}
+        end = time.time() + timeout
+        while time.time() < end and len(got) < len(names):
+            msg = self.mav.recv_match(type='PARAM_VALUE', blocking=True, timeout=0.3)
+            if msg is None:
+                break
+            got[msg.param_id] = msg.param_value
+        return got
+
+    def _init_aux(self):
+        """Read the AUX wiring so the mount/lights panels know what they can drive."""
+        names = ['SERVO9_FUNCTION', 'MNT1_PITCH_MIN', 'MNT1_PITCH_MAX'] + \
+                ['BTN%d_FUNCTION' % i for i in range(16)]
+        got = self._fetch(names)
+        bits = {}
+        for i in range(16):
+            name = BTN_LIGHTS.get(int(got.get('BTN%d_FUNCTION' % i) or 0))
+            if name is not None:
+                bits[name] = i
+        warn = None
+        if int(got.get('SERVO9_FUNCTION') or 0) != MOUNT_FUNC:
+            warn = 'AUX1 未分配 mount_tilt（SERVO9_FUNCTION=%s，应为 %d），舵机滑块不会动' % (
+                got.get('SERVO9_FUNCTION'), MOUNT_FUNC)
+        elif not bits:
+            warn = '没有 BTNx_FUNCTION 映射到 lights1，灯无法控制'
+        self._set(mount_min=got.get('MNT1_PITCH_MIN', -90),
+                  mount_max=got.get('MNT1_PITCH_MAX', 20),
+                  light_bits=bits, warn=warn)
 
     def _hb(self, force=False):
         now = time.time()
@@ -278,6 +429,10 @@ class Tester:
                 self.last_hb = time.time()
                 self._set(armed=bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED),
                           mode=mavutil.mode_string_v10(msg))
+            elif t == 'SERVO_OUTPUT_RAW' and getattr(msg, 'port', 0) == 0:
+                self.out_ts = time.time()
+                self._set(out=[getattr(msg, 'servo%d_raw' % i) for i in range(1, 9)],
+                          aux=[getattr(msg, 'servo9_raw'), getattr(msg, 'servo10_raw')])
             elif t == 'STATUSTEXT':
                 text = msg.text
                 if isinstance(text, bytes):
@@ -301,6 +456,10 @@ class Tester:
             with self.lock:
                 armed = self.state['armed']
             if armed:
+                # armed flag flips in the heartbeat at the same moment the
+                # motors library latches; init_motor_test() rejects anything
+                # sent in that window and then locks out for 2 s.
+                time.sleep(0.8)
                 return
             time.sleep(0.05)
         raise RuntimeError('arm timeout')
@@ -321,7 +480,37 @@ class Tester:
             armed = self.state['armed']
         self._set(phase='idle', armed=armed)
 
-    def _motor_cmd(self, motor, percent):
+    def _manual(self, buttons):
+        # MANUAL_CONTROL is the only MAVLink path into ArduSub's joystick button
+        # handlers (BTNx_FUNCTION); values are 0 so the sticks stay neutral.
+        try:
+            self.mav.mav.manual_control_send(1, 0, 0, 0, 0, buttons, 0, 0)
+        except TypeError:
+            self.mav.mav.manual_control_send(1, 0, 0, 0, 0, buttons)
+
+    def _light(self, name, repeat=1):
+        # Buttons fire on the rising edge only, so every step needs a release.
+        bit = self.state['light_bits'].get(name)
+        if bit is None:
+            self._set(last_error='没有映射到 lights1 的按键（需要 BTNx_FUNCTION=31/32/33）')
+            return
+        for _ in range(repeat):
+            self._manual(1 << bit)
+            time.sleep(0.12)
+            self._manual(0)
+            time.sleep(0.12)
+        self._set(last_statustext='lights %s x%d' % (name, repeat))
+
+    def _mount(self, pitch):
+        self._command(mavutil.mavlink.MAV_CMD_DO_MOUNT_CONTROL, pitch, 0, 0, 0, 0, 0,
+                      mavutil.mavlink.MAV_MOUNT_MODE_MAVLINK_TARGETING)
+        self._set(mount_pitch=pitch, last_statustext='mount pitch %.0f deg' % pitch)
+
+    def _motor_cmd(self, motor, thrust):
+        # Signed thrust -> ArduPilot motor-test percent. handle_do_motor_test()
+        # maps percent linearly onto RC3_MIN..MAX, so percent 50 = PWM 1500 and
+        # percent 0 = PWM 1100 (full reverse) -- never use 0 as "stop".
+        percent = 50.0 + thrust / 2.0
         # ArduSub handle_do_motor_test() passes the 1-based motor number to
         # AP_MotorsMatrix::output_test_num(), which indexes motors from 0.
         # Subtract one here so the UI's M1..M8 map to physical outputs 1..8.
@@ -331,7 +520,7 @@ class Tester:
                       percent, 1, 1, mavutil.mavlink.MOTOR_TEST_ORDER_BOARD, 0)
 
     def _begin_test(self):
-        motor, percent, seconds = self.pending
+        motor, thrust, seconds = self.pending
         self.pending = None
         self._set(last_error=None, last_statustext=None)
         try:
@@ -349,13 +538,15 @@ class Tester:
                 self._safe_stop()
                 self._set(phase='idle')
                 return
-            self._set(testing=True, phase='testing', motor=motor, percent=percent,
+            self._set(testing=True, phase='testing', motor=motor, thrust=thrust,
                       remaining=seconds, last_error=None)
             self.end_time = time.time() + seconds
             self.next_cmd = 0.0
             self.stop_requested = False
+            self.verified = False
+            self.verify_deadline = time.time() + VERIFY_TIMEOUT
         except Exception as e:
-            self._set(testing=False, phase='idle', motor=None, percent=None,
+            self._set(testing=False, phase='idle', motor=None, thrust=None,
                       remaining=None, last_error=str(e))
             self._safe_stop()
 
@@ -385,7 +576,7 @@ class Tester:
         except Exception as e:
             self._set(last_error='finish failed: %s' % e)
         finally:
-            self._set(testing=False, phase='idle', motor=None, percent=None,
+            self._set(testing=False, phase='idle', motor=None, thrust=None,
                       remaining=None)
             self.stop_requested = False
             self.disarm_requested = False
@@ -400,7 +591,7 @@ class Tester:
                 if self.pending is not None or self.testing:
                     self._set(last_error='busy: test already running')
                     continue
-                self.pending = (kw['motor'], kw['percent'], kw['seconds'])
+                self.pending = (kw['motor'], kw['thrust'], kw['seconds'])
                 self._set(last_error=None, last_statustext=None, phase='queued')
             elif action == 'stop':
                 self.stop_requested = True
@@ -411,6 +602,10 @@ class Tester:
                 self.disarm_requested = True
                 if not self.testing and self.pending is None:
                     self._safe_stop()
+            elif action == 'light':
+                self._light(kw['name'], kw.get('repeat', 1))
+            elif action == 'mount':
+                self._mount(kw['pitch'])
 
     def _step(self):
         self._hb()
@@ -428,12 +623,39 @@ class Tester:
                 return
             if now >= self.next_cmd:
                 self._hb(force=True)
-                self._motor_cmd(self.state['motor'], self.state['percent'])
+                self._motor_cmd(self.state['motor'], self.state['thrust'])
                 self.next_cmd = now + 0.2
+            if not self.verified and now >= self.verify_deadline:
+                self._verify_output()
+                if not self.testing:
+                    return
             with self.lock:
                 self.state['remaining'] = max(0.0, self.end_time - now)
         else:
             time.sleep(0.05)
+
+    def _verify_output(self):
+        """Abort if the commanded channel did not actually move.
+
+        On the bench the FC has been seen to accept arm and ignore the motor
+        test entirely (all outputs pinned at 1500); without this check the run
+        looks successful and teaches nothing.
+        """
+        with self.lock:
+            motor = self.state['motor']
+            thrust = self.state['thrust']
+            out = self.state['out']
+        target = int(round(1500 + thrust * 4))
+        if out is None or time.time() - self.out_ts > 1.0:
+            self._set(last_error='M%d 无 SERVO_OUTPUT_RAW，未确认输出' % motor)
+            self._finish_test('no telemetry')
+            return
+        actual = out[motor - 1]
+        if abs(actual - target) > 25:
+            self._set(last_error='M%d 无响应：目标 %d，实测 %d' % (motor, target, actual))
+            self._finish_test('no response')
+            return
+        self.verified = True
 
 
 tester = Tester()
@@ -483,16 +705,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 motor = int(data['motor'])
-                percent = float(data['percent'])
+                thrust = float(data['thrust'])
                 seconds = float(data['seconds'])
             except Exception:
-                self._json(400, {'error': 'motor/percent/seconds required'})
+                self._json(400, {'error': 'motor/thrust/seconds required'})
                 return
             if not 1 <= motor <= 8:
                 self._json(400, {'error': 'motor must be 1..8'})
                 return
-            if not 0 < percent <= MAX_PERCENT:
-                self._json(400, {'error': 'percent must be 0..%s' % MAX_PERCENT})
+            if thrust == 0:
+                self._json(400, {'error': 'thrust 0 means stop; use -%s..%s' % (MAX_THRUST, MAX_THRUST)})
+                return
+            if not abs(thrust) <= MAX_THRUST:
+                self._json(400, {'error': 'thrust must be -%s..%s' % (MAX_THRUST, MAX_THRUST)})
                 return
             if not 0 < seconds <= MAX_SECONDS:
                 self._json(400, {'error': 'seconds must be 0..%s' % MAX_SECONDS})
@@ -501,7 +726,42 @@ class Handler(BaseHTTPRequestHandler):
             if s['testing'] or s['phase'] in ('queued', 'arming'):
                 self._json(409, {'error': 'busy'})
                 return
-            tester.submit('test', motor=motor, percent=percent, seconds=seconds)
+            tester.submit('test', motor=motor, thrust=thrust, seconds=seconds)
+            self._json(202, {'ok': True})
+            return
+
+        if self.path == '/api/light':
+            name = data.get('name')
+            if name not in ('brighter', 'dimmer', 'cycle'):
+                self._json(400, {'error': 'name must be brighter/dimmer/cycle'})
+                return
+            try:
+                repeat = int(data.get('repeat', 1))
+            except Exception:
+                repeat = 1
+            if not 1 <= repeat <= 12:
+                self._json(400, {'error': 'repeat must be 1..12'})
+                return
+            if tester.status()['testing']:
+                self._json(409, {'error': 'busy'})
+                return
+            tester.submit('light', name=name, repeat=repeat)
+            self._json(202, {'ok': True})
+            return
+
+        if self.path == '/api/mount':
+            try:
+                pitch = float(data['pitch'])
+            except Exception:
+                self._json(400, {'error': 'pitch required'})
+                return
+            if not -90 <= pitch <= 90:
+                self._json(400, {'error': 'pitch must be -90..90'})
+                return
+            if tester.status()['testing']:
+                self._json(409, {'error': 'busy'})
+                return
+            tester.submit('mount', pitch=pitch)
             self._json(202, {'ok': True})
             return
 
